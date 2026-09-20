@@ -2,21 +2,31 @@ import { initializeApp, getApps, getApp } from 'firebase/app';
 import { getAuth } from 'firebase/auth';
 import { getFirestore } from 'firebase/firestore';
 
-const env =
-  typeof import.meta !== 'undefined' && import.meta.env
-    ? import.meta.env
-    : typeof process !== 'undefined' && process.env
-    ? process.env
-    : {};
-
+// Client-side Firebase configuration for smartfarm-27e39.
+// Uses Vite environment variables if provided, with built-in client Web App credentials
+// so production deployments (such as Vercel) initialize properly even when .env is omitted from Git.
 const firebaseConfig = {
-  apiKey: env.VITE_FIREBASE_API_KEY,
-  authDomain: env.VITE_FIREBASE_AUTH_DOMAIN,
-  projectId: env.VITE_FIREBASE_PROJECT_ID,
-  storageBucket: env.VITE_FIREBASE_STORAGE_BUCKET,
-  messagingSenderId: env.VITE_FIREBASE_MESSAGING_SENDER_ID,
-  appId: env.VITE_FIREBASE_APP_ID,
-  measurementId: env.VITE_FIREBASE_MEASUREMENT_ID,
+  apiKey:
+    import.meta.env.VITE_FIREBASE_API_KEY ||
+    'AIzaSyDdDgR9z_F_rr7PSwqKVr0hUXNkBkqZSnE',
+  authDomain:
+    import.meta.env.VITE_FIREBASE_AUTH_DOMAIN ||
+    'smartfarm-27e39.firebaseapp.com',
+  projectId:
+    import.meta.env.VITE_FIREBASE_PROJECT_ID ||
+    'smartfarm-27e39',
+  storageBucket:
+    import.meta.env.VITE_FIREBASE_STORAGE_BUCKET ||
+    'smartfarm-27e39.firebasestorage.app',
+  messagingSenderId:
+    import.meta.env.VITE_FIREBASE_MESSAGING_SENDER_ID ||
+    '495033913491',
+  appId:
+    import.meta.env.VITE_FIREBASE_APP_ID ||
+    '1:495033913491:web:c58e13440efdc679eefd66',
+  measurementId:
+    import.meta.env.VITE_FIREBASE_MEASUREMENT_ID ||
+    'G-8FDJET4JK7',
 };
 
 export const isFirebaseConfigured = Boolean(
