@@ -3,7 +3,7 @@ import { useParams, Link, useNavigate } from 'react-router-dom';
 import { useAuth } from '../context/useAuth';
 import { useLanguage } from '../context/useLanguage';
 import { getSampleProductById } from '../data/sampleProducts';
-import { getProductById } from '../services/productService';
+import { getProductById, subscribeProductById } from '../services/productService';
 import { createOrder } from '../services/orderService';
 import { createBooking, calculateRentalDays } from '../services/bookingService';
 import {
@@ -48,7 +48,7 @@ function ProductDetails() {
   const sampleProduct = getSampleProductById(id);
 
   const [product, setProduct] = useState(sampleProduct);
-  const [loading, setLoading] = useState(!sampleProduct);
+  const [loading, setLoading] = useState(true);
   const [imageError, setImageError] = useState(false);
 
   // Order modal states
@@ -95,38 +95,47 @@ function ProductDetails() {
     }
   }, [user]);
 
+  // Subscribe to real-time product updates from Firestore
   useEffect(() => {
-    let isSubscribed = true;
+    let isMounted = true;
 
-    async function load() {
-      if (sampleProduct) {
-        setProduct(sampleProduct);
-        setLoading(false);
-        loadProductReviews(id);
-        return;
-      }
-
-      try {
-        setLoading(true);
-        const data = await getProductById(id);
-        if (isSubscribed) {
-          setProduct(data);
+    const unsubscribe = subscribeProductById(
+      id,
+      (liveProduct) => {
+        if (!isMounted) return;
+        if (liveProduct) {
+          setProduct(liveProduct);
           setLoading(false);
           loadProductReviews(id);
+        } else if (sampleProduct) {
+          // Fallback to local sample product if document is not in Firestore
+          setProduct(sampleProduct);
+          setLoading(false);
+          loadProductReviews(id);
+        } else {
+          setProduct(null);
+          setLoading(false);
         }
-      } catch (err) {
-        if (isSubscribed) {
-          console.error('Error loading product by ID:', err);
+      },
+      (err) => {
+        if (!isMounted) return;
+        console.warn('Real-time listener notice for product:', err.message);
+        if (sampleProduct) {
+          setProduct(sampleProduct);
+          setLoading(false);
+          loadProductReviews(id);
+        } else {
           setProduct(null);
           setLoading(false);
         }
       }
-    }
-
-    load();
+    );
 
     return () => {
-      isSubscribed = false;
+      isMounted = false;
+      if (typeof unsubscribe === 'function') {
+        unsubscribe();
+      }
     };
   }, [id, sampleProduct, loadProductReviews]);
 

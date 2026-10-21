@@ -32,7 +32,7 @@ const PRODUCTS_COLLECTION = 'products';
  * @param {string} [params.buyerName] - Display name of the buyer
  * @returns {Promise<Object>} Created order document data including orderId
  */
-export async function createOrder({ productId, quantity, buyerId, buyerName }) {
+export async function createOrder({ productId, quantity, buyerId, buyerName, clientOrderId }) {
   if (!db) {
     throw new Error('Firestore is not initialized. Check your credentials in .env.');
   }
@@ -52,6 +52,20 @@ export async function createOrder({ productId, quantity, buyerId, buyerName }) {
 
   try {
     const newOrder = await runTransaction(db, async (transaction) => {
+      // 1. Prepare Order Document Reference (supports idempotent clientOrderId)
+      const orderDocRef = clientOrderId
+        ? doc(db, ORDERS_COLLECTION, clientOrderId)
+        : doc(collection(db, ORDERS_COLLECTION));
+
+      if (clientOrderId) {
+        const existingOrderSnap = await transaction.get(orderDocRef);
+        if (existingOrderSnap.exists()) {
+          // Idempotent return: order already processed
+          return { id: existingOrderSnap.id, ...existingOrderSnap.data() };
+        }
+      }
+
+      // 2. Fetch product document
       const productRef = doc(db, PRODUCTS_COLLECTION, productId);
       const productDoc = await transaction.get(productRef);
 
@@ -77,23 +91,28 @@ export async function createOrder({ productId, quantity, buyerId, buyerName }) {
         throw new Error('You cannot purchase your own product.');
       }
 
-      const currentStock = Number(product.quantity) || 0;
+      const currentStock = Math.max(0, Number(product.quantity) || 0);
 
       // Check stock availability
+      if (currentStock <= 0) {
+        throw new Error('This product is currently out of stock.');
+      }
+
       if (currentStock < requestedQty) {
-        throw new Error('Insufficient quantity available.');
+        const unit = category === 'crop' ? 'kg' : 'units';
+        throw new Error(`Insufficient quantity available. Only ${currentStock} ${unit} remaining.`);
       }
 
       const remainingStock = currentStock - requestedQty;
 
-      // 1. Update product quantity atomically
+      // 3. Update product quantity atomically (serializable isolation prevents overselling)
       transaction.update(productRef, {
         quantity: remainingStock,
+        lastOrderId: orderDocRef.id,
         updatedAt: serverTimestamp(),
       });
 
-      // 2. Prepare Order Document
-      const orderDocRef = doc(collection(db, ORDERS_COLLECTION));
+      // 4. Prepare Order Document Payload
       const unitPrice = Number(product.price) || 0;
       const totalPrice = unitPrice * requestedQty;
 
@@ -116,6 +135,10 @@ export async function createOrder({ productId, quantity, buyerId, buyerName }) {
         location: product.location || '',
 
         status: 'pending',
+        paymentStatus: 'pending',
+        paymentMethod: 'cash_on_delivery',
+        stockDeducted: true,
+        stockRestored: false,
 
         createdAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
@@ -125,7 +148,6 @@ export async function createOrder({ productId, quantity, buyerId, buyerName }) {
 
       return {
         ...orderPayload,
-        // Approximate client-side timestamp for immediate display before refetch
         createdAt: new Date().toISOString(),
       };
     });
@@ -136,13 +158,14 @@ export async function createOrder({ productId, quantity, buyerId, buyerName }) {
     // Preserve custom validation messages or return user-friendly error
     if (
       error.message?.includes('Insufficient quantity available') ||
+      error.message?.includes('out of stock') ||
       error.message?.includes('You cannot purchase your own product') ||
       error.message?.includes('Product not found') ||
       error.message?.includes('valid quantity')
     ) {
       throw error;
     }
-    throw new Error('Unable to place order. Please try again.');
+    throw new Error(error.message || 'Unable to place order. Please try again.');
   }
 }
 
@@ -234,4 +257,105 @@ export async function updateOrderStatus(orderId, status) {
     status: String(status).trim().toLowerCase(),
     updatedAt: serverTimestamp(),
   });
+}
+
+/**
+ * Cancel a pending purchase order and atomically restore deducted stock to the product document.
+ *
+ * Enforces:
+ * 1. Caller must be the buyer.
+ * 2. Order status must be 'pending'.
+ * 3. Atomic stock restoration in products/{productId}.
+ * 4. Single-restoration guard (stockRestored: true) preventing duplicate restoration.
+ *
+ * @param {string} orderId - Document ID of the order to cancel
+ * @param {string} currentUserId - Firebase Auth UID of the cancelling buyer
+ * @returns {Promise<Object>} Updated order document
+ */
+export async function cancelOrder(orderId, currentUserId) {
+  if (!db || !orderId) {
+    throw new Error('Invalid order ID or database instance.');
+  }
+
+  if (!currentUserId) {
+    throw new Error('Authentication required: You must be logged in to cancel an order.');
+  }
+
+  try {
+    const result = await runTransaction(db, async (transaction) => {
+      const orderRef = doc(db, ORDERS_COLLECTION, orderId);
+      const orderDoc = await transaction.get(orderRef);
+
+      if (!orderDoc.exists()) {
+        throw new Error('Order not found.');
+      }
+
+      const order = orderDoc.data();
+
+      // Authorization Check: buyer can cancel pending orders; seller can cancel pending or confirmed orders
+      const isBuyer = order.buyerId === currentUserId;
+      const isSeller = order.sellerId === currentUserId;
+
+      if (!isBuyer && !isSeller) {
+        throw new Error('Permission denied: You can only cancel orders you are involved with.');
+      }
+
+      const currentStatus = (order.status || '').toLowerCase();
+      if (currentStatus === 'cancelled') {
+        throw new Error('This order has already been cancelled.');
+      }
+
+      if (currentStatus === 'completed') {
+        throw new Error('Completed orders cannot be cancelled.');
+      }
+
+      if (isBuyer && currentStatus !== 'pending') {
+        throw new Error(`Buyers can only cancel pending orders (current status: ${order.status}).`);
+      }
+
+      if (isSeller && currentStatus !== 'pending' && currentStatus !== 'confirmed') {
+        throw new Error(`Sellers can only cancel pending or confirmed orders (current status: ${order.status}).`);
+      }
+
+      // Check if stock was previously deducted and not yet restored
+      const shouldRestoreStock = order.stockDeducted !== false && order.stockRestored !== true;
+
+      if (shouldRestoreStock && order.productId && order.quantity) {
+        const productRef = doc(db, PRODUCTS_COLLECTION, order.productId);
+        const productDoc = await transaction.get(productRef);
+
+        if (productDoc.exists()) {
+          const currentStock = Math.max(0, Number(productDoc.data().quantity) || 0);
+          const returnQty = Math.max(0, Number(order.quantity) || 0);
+          const restoredStock = currentStock + returnQty;
+
+          // Restore product stock atomically
+          transaction.update(productRef, {
+            quantity: restoredStock,
+            lastOrderId: orderId,
+            updatedAt: serverTimestamp(),
+          });
+        }
+      }
+
+      // Update Order Status to cancelled with audit fields
+      transaction.update(orderRef, {
+        status: 'cancelled',
+        stockRestored: true,
+        cancelledAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+
+      return {
+        ...order,
+        status: 'cancelled',
+        stockRestored: true,
+      };
+    });
+
+    return result;
+  } catch (error) {
+    console.error('Failed to cancel order:', error);
+    throw error;
+  }
 }

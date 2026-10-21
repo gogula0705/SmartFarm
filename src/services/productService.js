@@ -8,6 +8,7 @@ import {
   deleteDoc,
   query,
   where,
+  onSnapshot,
   serverTimestamp,
 } from 'firebase/firestore';
 import { db } from '../config/firebase.js';
@@ -34,7 +35,7 @@ function sanitizeProductPayload(data, category) {
       variety: (data.variety || '').trim(),
       cropType: (data.cropType || '').trim(),
       price: Number(data.price) || 0,
-      quantity: typeof data.quantity === 'number' ? data.quantity : (data.quantity || '').toString().trim(),
+      quantity: Math.max(0, Number(data.quantity) || 0),
     };
   }
 
@@ -52,7 +53,7 @@ function sanitizeProductPayload(data, category) {
   if (category === 'crop') {
     return {
       ...common,
-      quantity: typeof data.quantity === 'number' ? data.quantity : (data.quantity || '').toString().trim(),
+      quantity: Math.max(0, Number(data.quantity) || 0),
       quality: (data.quality || 'Grade A').trim(),
       price: Number(data.price) || 0,
       harvestDate: (data.harvestDate || '').trim(),
@@ -231,17 +232,23 @@ export async function deleteProduct(productId, currentUserId) {
  * @param {number} reviewCount - Total review count
  * @returns {Promise<void>}
  */
-export async function updateProductRating(productId, rating, reviewCount) {
+export async function updateProductRating(productId, rating, reviewCount, lastReviewId) {
   if (!db || !productId) {
     throw new Error('Invalid product ID or database instance.');
   }
 
   const docRef = doc(db, PRODUCTS_COLLECTION, productId);
-  await updateDoc(docRef, {
+  const payload = {
     rating: Number(rating) || 0,
     reviewCount: Number(reviewCount) || 0,
     updatedAt: serverTimestamp(),
-  });
+  };
+
+  if (lastReviewId) {
+    payload.lastReviewId = String(lastReviewId).trim();
+  }
+
+  await updateDoc(docRef, payload);
 }
 
 /**
@@ -306,5 +313,142 @@ export async function getMarketplaceProducts() {
   } catch (error) {
     console.error('Error fetching marketplace products:', error);
     throw new Error('Failed to load marketplace products: ' + (error.message || 'Database error'));
+  }
+}
+
+/**
+ * Subscribe to live Marketplace products using Firestore real-time listeners.
+ * Emits updated product lists whenever any product is added, updated, purchased, or restocked.
+ *
+ * @param {Function} callback - (products: Array<Object>) => void
+ * @param {Function} [onError] - (error: Error) => void
+ * @returns {Function} Unsubscribe function
+ */
+export function subscribeMarketplaceProducts(callback, onError) {
+  if (!db) {
+    if (onError) onError(new Error('Firestore is not initialized.'));
+    return () => {};
+  }
+
+  try {
+    const q = query(
+      collection(db, PRODUCTS_COLLECTION),
+      where('status', '==', 'active')
+    );
+
+    return onSnapshot(
+      q,
+      (snapshot) => {
+        const products = snapshot.docs.map((docSnap) => ({
+          id: docSnap.id,
+          ...docSnap.data(),
+        }));
+
+        products.sort((a, b) => {
+          const timeA = a.createdAt?.toMillis?.() || (a.createdAt ? new Date(a.createdAt).getTime() : 0);
+          const timeB = b.createdAt?.toMillis?.() || (b.createdAt ? new Date(b.createdAt).getTime() : 0);
+          return timeB - timeA;
+        });
+
+        callback(products);
+      },
+      (error) => {
+        console.error('Error in marketplace products subscription:', error);
+        if (onError) onError(error);
+      }
+    );
+  } catch (err) {
+    console.error('Failed to attach marketplace listener:', err);
+    if (onError) onError(err);
+    return () => {};
+  }
+}
+
+/**
+ * Subscribe to live updates for a single product by ID.
+ * Keeps stock, availability, rating, and details synchronized in real time.
+ *
+ * @param {string} productId
+ * @param {Function} callback - (product: Object|null) => void
+ * @param {Function} [onError] - (error: Error) => void
+ * @returns {Function} Unsubscribe function
+ */
+export function subscribeProductById(productId, callback, onError) {
+  if (!db || !productId) {
+    if (onError) onError(new Error('Invalid product ID or database instance.'));
+    return () => {};
+  }
+
+  try {
+    const docRef = doc(db, PRODUCTS_COLLECTION, productId);
+    return onSnapshot(
+      docRef,
+      (docSnap) => {
+        if (docSnap.exists()) {
+          callback({
+            id: docSnap.id,
+            ...docSnap.data(),
+          });
+        } else {
+          callback(null);
+        }
+      },
+      (error) => {
+        console.error(`Error in product listener for ${productId}:`, error);
+        if (onError) onError(error);
+      }
+    );
+  } catch (err) {
+    console.error('Failed to attach product listener:', err);
+    if (onError) onError(err);
+    return () => {};
+  }
+}
+
+/**
+ * Subscribe to live inventory updates for all products owned by a specific user.
+ *
+ * @param {string} userId
+ * @param {Function} callback - (products: Array<Object>) => void
+ * @param {Function} [onError] - (error: Error) => void
+ * @returns {Function} Unsubscribe function
+ */
+export function subscribeUserProducts(userId, callback, onError) {
+  if (!db || !userId) {
+    if (onError) onError(new Error('Invalid user ID or database instance.'));
+    return () => {};
+  }
+
+  try {
+    const q = query(
+      collection(db, PRODUCTS_COLLECTION),
+      where('ownerId', '==', userId)
+    );
+
+    return onSnapshot(
+      q,
+      (snapshot) => {
+        const products = snapshot.docs.map((docSnap) => ({
+          id: docSnap.id,
+          ...docSnap.data(),
+        }));
+
+        products.sort((a, b) => {
+          const timeA = a.createdAt?.toMillis?.() || (a.createdAt ? new Date(a.createdAt).getTime() : 0);
+          const timeB = b.createdAt?.toMillis?.() || (b.createdAt ? new Date(b.createdAt).getTime() : 0);
+          return timeB - timeA;
+        });
+
+        callback(products);
+      },
+      (error) => {
+        console.error('Error in user products subscription:', error);
+        if (onError) onError(error);
+      }
+    );
+  } catch (err) {
+    console.error('Failed to attach user products listener:', err);
+    if (onError) onError(err);
+    return () => {};
   }
 }

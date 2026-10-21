@@ -2,7 +2,12 @@ import { useState, useEffect } from 'react';
 import { Link, useLocation } from 'react-router-dom';
 import { useAuth } from '../context/useAuth';
 import { useLanguage } from '../context/useLanguage';
-import { getUserProducts, deleteProduct, updateProductStatus } from '../services/productService';
+import {
+  getUserProducts,
+  subscribeUserProducts,
+  deleteProduct,
+  updateProductStatus,
+} from '../services/productService';
 
 /**
  * Format currency in Indian Rupees (₹)
@@ -33,40 +38,43 @@ function MyProducts() {
   // Image load error tracker by product ID
   const [brokenImages, setBrokenImages] = useState({});
 
-  // Re-fetch trigger state
-  const [refreshIndex, setRefreshIndex] = useState(0);
-
   useEffect(() => {
-    let isSubscribed = true;
-
-    async function load() {
-      if (!user?.uid) return;
-      try {
-        setError('');
-        const data = await getUserProducts(user.uid);
-        if (isSubscribed) {
-          setProducts(data);
-          setLoading(false);
-        }
-      } catch (err) {
-        if (isSubscribed) {
-          console.error('Error loading user products:', err);
-          setError('Unable to load your products.');
-          setLoading(false);
-        }
-      }
+    if (!user?.uid) {
+      return;
     }
 
-    load();
+    const unsubscribe = subscribeUserProducts(
+      user.uid,
+      (data) => {
+        setProducts(data);
+        setLoading(false);
+      },
+      (err) => {
+        console.error('Error listening to user products:', err);
+        setError('Unable to load your products.');
+        setLoading(false);
+      }
+    );
 
     return () => {
-      isSubscribed = false;
+      if (typeof unsubscribe === 'function') {
+        unsubscribe();
+      }
     };
-  }, [user?.uid, refreshIndex]);
+  }, [user?.uid]);
 
-  const reloadProducts = () => {
-    setLoading(true);
-    setRefreshIndex((prev) => prev + 1);
+  const reloadProducts = async () => {
+    if (!user?.uid) return;
+    try {
+      setLoading(true);
+      setError('');
+      const data = await getUserProducts(user.uid);
+      setProducts(data);
+    } catch (err) {
+      setError(err.message || 'Failed to reload products');
+    } finally {
+      setLoading(false);
+    }
   };
 
   // Dismiss notification banner after 5 seconds
@@ -422,10 +430,10 @@ function MyProducts() {
                               {product.variety} ({product.cropType})
                             </span>
                           </div>
-                          <div className="flex justify-between">
-                            <span className="text-gray-500">{t('products.stockQuantity')}</span>
-                            <span className="font-semibold text-gray-800">
-                              {product.quantity} kg / units
+                          <div className="flex justify-between items-center">
+                            <span className="text-gray-500">{t('products.stockQuantity')}:</span>
+                            <span className={`font-semibold ${Number(product.quantity) <= 0 ? 'text-red-600 bg-red-50 px-2 py-0.5 rounded text-[11px]' : 'text-gray-800'}`}>
+                              {Number(product.quantity) <= 0 ? `${t('products.outOfStock')} (0)` : `${product.quantity} kg / units`}
                             </span>
                           </div>
                           <div className="flex justify-between items-baseline pt-1 border-t border-gray-200">
@@ -477,10 +485,10 @@ function MyProducts() {
                               {product.quality || 'Grade A'}
                             </span>
                           </div>
-                          <div className="flex justify-between">
-                            <span className="text-gray-500">{t('products.availableQuantity')}</span>
-                            <span className="font-semibold text-gray-800">
-                              {product.quantity} kg
+                          <div className="flex justify-between items-center">
+                            <span className="text-gray-500">{t('products.availableQuantity')}:</span>
+                            <span className={`font-semibold ${Number(product.quantity) <= 0 ? 'text-red-600 bg-red-50 px-2 py-0.5 rounded text-[11px]' : 'text-gray-800'}`}>
+                              {Number(product.quantity) <= 0 ? `${t('products.outOfStock')} (0)` : `${product.quantity} kg`}
                             </span>
                           </div>
                           <div className="flex justify-between items-baseline pt-1 border-t border-gray-200">

@@ -2,7 +2,7 @@ import { useState, useEffect } from 'react';
 import { Link, useLocation } from 'react-router-dom';
 import { useAuth } from '../context/useAuth';
 import { useLanguage } from '../context/useLanguage';
-import { getUserOrders } from '../services/orderService';
+import { getUserOrders, cancelOrder } from '../services/orderService';
 import { getUserReviewedTransactionIds } from '../services/reviewService';
 import ReviewModal from '../components/ReviewModal';
 
@@ -88,6 +88,35 @@ function Orders() {
   const [filterStatus, setFilterStatus] = useState('all');
   const [reviewedTxIds, setReviewedTxIds] = useState(new Set());
   const [reviewingOrder, setReviewingOrder] = useState(null);
+  const [cancellingOrderId, setCancellingOrderId] = useState(null);
+
+  // Handle order cancellation with atomic stock restoration
+  const handleCancelOrder = async (orderId) => {
+    if (!orderId || !user?.uid) return;
+
+    const confirmed = window.confirm(
+      'Are you sure you want to cancel this order? The reserved product stock will be immediately returned to the farmer.'
+    );
+    if (!confirmed) return;
+
+    try {
+      setCancellingOrderId(orderId);
+      setError('');
+      await cancelOrder(orderId, user.uid);
+      setOrders((prev) =>
+        prev.map((o) => (o.id === orderId ? { ...o, status: 'cancelled', stockRestored: true } : o))
+      );
+      if (selectedOrder && (selectedOrder.id === orderId || selectedOrder.orderId === orderId)) {
+        setSelectedOrder((prev) => (prev ? { ...prev, status: 'cancelled', stockRestored: true } : null));
+      }
+      setSuccessBanner('Order cancelled successfully. Reserved product stock has been returned to the farmer.');
+    } catch (err) {
+      console.error('Failed to cancel order:', err);
+      setError(err.message || 'Unable to cancel order. Please try again.');
+    } finally {
+      setCancellingOrderId(null);
+    }
+  };
 
   useEffect(() => {
     let isSubscribed = true;
@@ -408,6 +437,17 @@ function Orders() {
                     >
                       {t('orders.viewDetails')}
                     </button>
+
+                    {(order.status || 'pending').toLowerCase() === 'pending' && (
+                      <button
+                        type="button"
+                        disabled={cancellingOrderId === (order.id || order.orderId)}
+                        onClick={() => handleCancelOrder(order.id || order.orderId)}
+                        className="px-3.5 py-2 bg-red-50 hover:bg-red-100 text-red-700 border border-red-200 rounded-xl text-xs font-semibold transition-colors cursor-pointer shadow-xs whitespace-nowrap disabled:opacity-50"
+                      >
+                        {cancellingOrderId === (order.id || order.orderId) ? 'Cancelling...' : 'Cancel'}
+                      </button>
+                    )}
                   </div>
                 </div>
               </div>
@@ -559,6 +599,16 @@ function Orders() {
                       <span>{t('orders.reviewProduct')}</span>
                     </button>
                   )
+                )}
+                {(selectedOrder.status || 'pending').toLowerCase() === 'pending' && (
+                  <button
+                    type="button"
+                    disabled={cancellingOrderId === (selectedOrder.id || selectedOrder.orderId)}
+                    onClick={() => handleCancelOrder(selectedOrder.id || selectedOrder.orderId)}
+                    className="flex-1 py-3 px-4 rounded-xl bg-red-600 hover:bg-red-700 text-white font-semibold text-sm transition-colors cursor-pointer shadow-xs disabled:opacity-50"
+                  >
+                    {cancellingOrderId === (selectedOrder.id || selectedOrder.orderId) ? 'Cancelling...' : 'Cancel Order'}
+                  </button>
                 )}
                 <button
                   type="button"

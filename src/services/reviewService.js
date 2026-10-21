@@ -13,7 +13,6 @@
 import {
   collection,
   doc,
-  addDoc,
   getDoc,
   getDocs,
   updateDoc,
@@ -21,6 +20,7 @@ import {
   query,
   where,
   serverTimestamp,
+  runTransaction,
 } from 'firebase/firestore';
 import { db } from '../config/firebase.js';
 import { updateProductRating } from './productService.js';
@@ -48,7 +48,7 @@ function sanitizeRating(rating) {
  * @param {string} productId
  * @returns {Promise<{ rating: number, reviewCount: number }>}
  */
-export async function recalculateProductRating(productId) {
+export async function recalculateProductRating(productId, lastReviewId = null) {
   if (!db || !productId) {
     throw new Error('Invalid product ID or Firestore database instance.');
   }
@@ -69,7 +69,7 @@ export async function recalculateProductRating(productId) {
   }
 
   // Update aggregated fields in products/{productId}
-  await updateProductRating(productId, averageRating, reviewCount);
+  await updateProductRating(productId, averageRating, reviewCount, lastReviewId);
 
   return { rating: averageRating, reviewCount };
 }
@@ -179,25 +179,52 @@ export async function createReview({
     throw new Error('You have already reviewed this transaction.');
   }
 
-  // 3. Save new review document
-  const payload = {
-    productId: trimmedProductId,
-    reviewerId: reviewerId.trim(),
-    reviewerName: (reviewerName || 'SmartFarm Member').trim(),
-    transactionType,
-    transactionId: trimmedTransactionId,
-    rating: validRating,
-    comment: (comment || '').trim(),
-    createdAt: serverTimestamp(),
-    updatedAt: serverTimestamp(),
-  };
+  // 3. Atomically create review document and update product rating aggregates
+  // Using trimmedTransactionId as the unique review document ID ensures 1 review per transaction
+  const reviewDocRef = doc(db, REVIEWS_COLLECTION, trimmedTransactionId);
+  const productRef = doc(db, 'products', trimmedProductId);
 
-  const docRef = await addDoc(collection(db, REVIEWS_COLLECTION), payload);
+  await runTransaction(db, async (transaction) => {
+    const productDoc = await transaction.get(productRef);
+    if (!productDoc.exists()) {
+      throw new Error('Product not found or has been removed.');
+    }
 
-  // 4. Recalculate product aggregate
-  await recalculateProductRating(trimmedProductId);
+    const productData = productDoc.data();
+    const currentReviewCount = Number(productData.reviewCount) || 0;
+    const currentRating = Number(productData.rating) || 0;
+    const newReviewCount = currentReviewCount + 1;
 
-  return docRef.id;
+    let newRating;
+    if (currentReviewCount === 0) {
+      newRating = validRating;
+    } else {
+      const totalScore = currentRating * currentReviewCount + validRating;
+      newRating = Math.round((totalScore / newReviewCount) * 10) / 10;
+    }
+
+    const payload = {
+      productId: trimmedProductId,
+      reviewerId: reviewerId.trim(),
+      reviewerName: (reviewerName || 'SmartFarm Member').trim(),
+      transactionType,
+      transactionId: trimmedTransactionId,
+      rating: validRating,
+      comment: (comment || '').trim(),
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    };
+
+    transaction.set(reviewDocRef, payload);
+    transaction.update(productRef, {
+      rating: newRating,
+      reviewCount: newReviewCount,
+      lastReviewId: reviewDocRef.id,
+      updatedAt: serverTimestamp(),
+    });
+  });
+
+  return reviewDocRef.id;
 }
 
 /**
@@ -305,18 +332,11 @@ export async function updateReview(reviewId, updateData, currentUserId) {
     updatedAt: serverTimestamp(),
   };
 
-  if (updateData.rating !== undefined) {
-    payload.rating = sanitizeRating(updateData.rating);
-  }
-
   if (updateData.comment !== undefined) {
     payload.comment = String(updateData.comment).trim();
   }
 
   await updateDoc(docRef, payload);
-
-  // Recalculate product aggregate
-  await recalculateProductRating(existing.productId);
 }
 
 /**
@@ -349,7 +369,7 @@ export async function deleteReview(reviewId, currentUserId) {
   await deleteDoc(docRef);
 
   // Recalculate product aggregate
-  await recalculateProductRating(existing.productId);
+  await recalculateProductRating(existing.productId, reviewId);
 }
 
 /**

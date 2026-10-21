@@ -1,0 +1,919 @@
+rules_version = '2';
+
+// ===============================================================
+// Assumed Data Model
+// ===============================================================
+//
+// Application: SmartFarm (Project ID: smartfarm-27e39)
+//
+// 1. Collection: users
+//    Document ID: {userId} (matches Firebase Auth UID)
+//    Fields:
+//      - uid: string (required, 1-128 chars, immutable, matches userId)
+//      - fullName: string (required, 2-100 chars)
+//      - email: string (required, valid email format, 3-100 chars, immutable)
+//      - phone: string (required string, max 20 chars)
+//      - location: string (required string, max 150 chars)
+//      - createdAt: timestamp (required, immutable)
+//      - updatedAt: timestamp (required)
+//    Access Controls:
+//      - Read: Private - authenticated owner only (isOwner(userId)) to protect PII
+//      - Create: Authenticated owner only (isOwner(userId)) with valid user schema
+//      - Update: Authenticated owner only; uid, email, and createdAt are immutable
+//      - Delete: Denied (false)
+//
+// 2. Collection: products
+//    Document ID: {productId} (auto-generated)
+//    Common Fields:
+//      - category: string ('seed' | 'tool' | 'crop')
+//      - title: string (1-120 chars)
+//      - description: string (0-2000 chars)
+//      - location: string (1-150 chars)
+//      - images: list of string URLs (max 10 items)
+//      - status: string ('active' | 'inactive')
+//      - ownerId: string (1-128 chars, immutable)
+//      - ownerName: string (1-100 chars)
+//      - rating: number (0-5)
+//      - reviewCount: int (>= 0)
+//      - createdAt: timestamp (immutable)
+//      - updatedAt: timestamp
+//      - lastOrderId: string (optional, 1-100 chars, set during purchase / stock restore)
+//      - lastReviewId: string (optional, 1-100 chars, set during review aggregation)
+//    Category Specific Fields:
+//      - Seed: variety (0-100 chars), cropType (0-100 chars), price (>= 0), quantity (>= 0)
+//      - Tool: equipmentType (0-100 chars), condition (0-50 chars), pricePerHour (>= 0), pricePerDay (>= 0), availability (0-50 chars)
+//      - Crop: quantity (>= 0), quality (0-50 chars), price (>= 0), harvestDate (0-50 chars)
+//    Access Controls:
+//      - Read: Public if status == 'active'; owner if inactive
+//      - Create: Authenticated seller (ownerId == request.auth.uid, ownerId != 'demo-owner-001')
+//      - Update:
+//          A. Owner edit (immutable ownerId and createdAt; demo-owner-001 protected)
+//          B. Non-owner buyer decrementing stock during purchase (atomic transaction with pending order)
+//          C. Non-owner buyer restoring stock during order cancellation (atomic transaction with cancelled order)
+//          D. Non-owner reviewer updating rating and reviewCount aggregates (atomic review creation transaction only)
+//      - Delete: Authenticated owner only (demo products and demo-owner-001 cannot be deleted)
+//
+// 3. Collection: orders
+//    Document ID: {orderId} (auto-generated or client order ID)
+//    Fields:
+//      - orderId: string (1-100 chars, immutable, matches orderId)
+//      - buyerId: string (1-128 chars, immutable, matches request.auth.uid)
+//      - buyerName: string (1-100 chars)
+//      - sellerId: string (1-128 chars, immutable, != buyerId)
+//      - sellerName: string (1-100 chars)
+//      - productId: string (1-100 chars, immutable)
+//      - productTitle: string (1-150 chars)
+//      - category: string ('seed' | 'crop')
+//      - quantity: number (> 0)
+//      - unitPrice: number (>= 0, immutable)
+//      - totalPrice: number (>= 0, immutable)
+//      - productImage: string (max 1000 chars)
+//      - location: string (max 150 chars)
+//      - status: string ('pending' | 'confirmed' | 'completed' | 'cancelled')
+//      - paymentStatus: string (max 50 chars)
+//      - paymentMethod: string (max 50 chars)
+//      - stockDeducted: bool (true on create)
+//      - stockRestored: bool (false on create)
+//      - createdAt: timestamp (immutable)
+//      - updatedAt: timestamp
+//      - cancelledAt: timestamp (optional, set upon buyer or seller cancellation)
+//    Access Controls:
+//      - Read: Buyer or Seller only
+//      - Create: Authenticated buyer placing order atomically verifying product price, stock deduction, and seller
+//      - Update:
+//          A. Buyer cancellation (strictly pending -> cancelled, restoring product stock atomically)
+//          B. Seller cancellation (strictly pending or confirmed -> cancelled, restoring product stock atomically)
+//          C. Seller confirmation (strictly pending -> confirmed)
+//          D. Seller completion (strictly confirmed -> completed)
+//          * Terminal states: completed and cancelled orders cannot be modified
+//      - Delete: Denied (false)
+//
+// 4. Collection: bookings
+//    Document ID: {bookingId} (auto-generated)
+//    Fields:
+//      - bookingId: string (1-100 chars)
+//      - renterId: string (1-128 chars, immutable, matches request.auth.uid)
+//      - renterName: string (1-100 chars)
+//      - ownerId: string (1-128 chars, immutable, != renterId)
+//      - ownerName: string (1-100 chars)
+//      - productId: string (1-100 chars, immutable)
+//      - productTitle: string (1-150 chars)
+//      - equipmentType: string (1-100 chars)
+//      - productImage: string (max 1000 chars)
+//      - location: string (max 150 chars)
+//      - startDate: string (10-20 chars)
+//      - endDate: string (10-20 chars)
+//      - rentalDays: number (>= 1)
+//      - pricePerDay: number (>= 0)
+//      - totalPrice: number (>= 0)
+//      - status: string ('pending' | 'confirmed' | 'completed' | 'cancelled')
+//      - createdAt: timestamp (immutable)
+//      - updatedAt: timestamp
+//    Access Controls:
+//      - Read: Authenticated users (enables double-booking schedule overlap verification)
+//      - Create: Authenticated renter validating product category ('tool'), owner, active status, daily rate, total calculation, and date chronology (startDate <= endDate)
+//      - Update:
+//          A. Renter cancellation (strictly pending -> cancelled)
+//          B. Owner confirmation (strictly pending -> confirmed)
+//          C. Owner completion (strictly confirmed -> completed)
+//          D. Owner cancellation (strictly pending or confirmed -> cancelled)
+//          * Terminal states: completed and cancelled bookings cannot be modified
+//      - Delete: Denied (false)
+//
+// 5. Collection: reviews
+//    Document ID: {transactionId} (deterministic 1:1 mapping with qualifying transaction)
+//    Fields:
+//      - productId: string (1-100 chars, immutable)
+//      - reviewerId: string (1-128 chars, immutable, matches request.auth.uid)
+//      - reviewerName: string (1-100 chars)
+//      - transactionType: string ('order' | 'booking', immutable)
+//      - transactionId: string (1-100 chars, immutable, matches reviewId)
+//      - rating: int (1-5, immutable once submitted)
+//      - comment: string (max 1000 chars)
+//      - createdAt: timestamp (immutable)
+//      - updatedAt: timestamp
+//    Access Controls:
+//      - Read: Public (true)
+//      - Create: Authenticated reviewer verifying completed qualifying transaction; reviewId == transactionId
+//      - Update: Reviewer only (comment, updatedAt only; rating is immutable)
+//      - Delete: Denied (false; preserves product rating aggregate integrity)
+//
+// 6. Collection: communityPosts
+//    Document ID: {postId} (auto-generated)
+//    Fields:
+//      - postId: string (1-100 chars)
+//      - title: string (1-200 chars)
+//      - content: string (1-5000 chars)
+//      - category: string (one of the 9 defined agricultural categories)
+//      - authorId: string (1-128 chars, immutable, matches request.auth.uid)
+//      - authorName: string (1-100 chars)
+//      - authorLocation: string (max 150 chars)
+//      - likesCount: int (>= 0)
+//      - commentsCount: int (>= 0)
+//      - createdAt: timestamp (immutable)
+//      - updatedAt: timestamp
+//      - lastCommentId: string (optional, 1-100 chars)
+//    Access Controls:
+//      - Read: Authenticated users
+//      - Create: Authenticated author (likesCount == 0, commentsCount == 0)
+//      - Update:
+//          A. Author editing post (title, content, category, updatedAt)
+//          B. Likes counter toggle (+1 or -1 with likes subcollection verification)
+//          C. Comments counter toggle (+1 or -1 with comments subcollection verification)
+//      - Delete: Authenticated author only
+//
+//    Subcollection: communityPosts/{postId}/likes/{likeUserId}
+//      Document ID: {likeUserId} (matches user.uid)
+//      Fields:
+//        - userId: string (matches likeUserId and request.auth.uid)
+//        - createdAt: timestamp
+//      Access Controls:
+//        - Read: Authenticated users
+//        - Create: Authenticated user creating their own like; parent post must exist
+//        - Update: Denied (false)
+//        - Delete: Authenticated user removing their own like
+//
+//    Subcollection: communityPosts/{postId}/comments/{commentId}
+//      Document ID: {commentId} (auto-generated)
+//      Fields:
+//        - commentId: string (1-100 chars)
+//        - postId: string (matches parent postId)
+//        - content: string (1-1000 chars)
+//        - authorId: string (matches request.auth.uid)
+//        - authorName: string (1-100 chars)
+//        - createdAt: timestamp (immutable)
+//        - updatedAt: timestamp
+//      Access Controls:
+//        - Read: Authenticated users
+//        - Create: Authenticated author; parent post must exist
+//        - Update: Comment author only (content, updatedAt)
+//        - Delete: Comment author only
+//
+// 7. Default Deny:
+//    All undefined paths deny read and write access.
+//
+// ===============================================================
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ===============================================================
+    // General Helper Functions
+    // ===============================================================
+
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    function isValidTimestamp(field) {
+      return field is timestamp;
+    }
+
+    function isValidString(val, minLen, maxLen) {
+      return val is string && val.size() >= minLen && val.size() <= maxLen;
+    }
+
+    function isValidEmail(email) {
+      return email is string
+        && email.matches('^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$');
+    }
+
+    // ===============================================================
+    // Domain Validators
+    // ===============================================================
+
+    // --- Users Validator ---
+    function isValidUser(data) {
+      return data.keys().hasAll(['uid', 'fullName', 'email', 'phone', 'location', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['uid', 'fullName', 'email', 'phone', 'location', 'createdAt', 'updatedAt'])
+        && isValidString(data.uid, 1, 128)
+        && isValidString(data.fullName, 2, 100)
+        && isValidString(data.email, 3, 100) && isValidEmail(data.email)
+        && data.phone is string && data.phone.size() <= 20
+        && data.location is string && data.location.size() <= 150
+        && isValidTimestamp(data.createdAt)
+        && isValidTimestamp(data.updatedAt);
+    }
+
+    // --- Products Validators ---
+    function isValidProductBase(data) {
+      return data.category in ['seed', 'tool', 'crop']
+        && isValidString(data.title, 1, 120)
+        && data.description is string && data.description.size() <= 2000
+        && isValidString(data.location, 1, 150)
+        && data.images is list && data.images.size() <= 10
+        && data.status in ['active', 'inactive']
+        && isValidString(data.ownerId, 1, 128)
+        && isValidString(data.ownerName, 1, 100)
+        && data.rating is number && data.rating >= 0 && data.rating <= 5
+        && data.reviewCount is int && data.reviewCount >= 0
+        && isValidTimestamp(data.createdAt)
+        && isValidTimestamp(data.updatedAt)
+        && (!('lastOrderId' in data) || (data.lastOrderId is string && data.lastOrderId.size() <= 100))
+        && (!('lastReviewId' in data) || (data.lastReviewId is string && data.lastReviewId.size() <= 100));
+    }
+
+    function isValidSeedProduct(data) {
+      return data.keys().hasAll([
+          'category', 'title', 'description', 'location', 'images', 'status',
+          'ownerId', 'ownerName', 'rating', 'reviewCount', 'createdAt', 'updatedAt',
+          'variety', 'cropType', 'price', 'quantity'
+        ])
+        && data.keys().hasOnly([
+          'category', 'title', 'description', 'location', 'images', 'status',
+          'ownerId', 'ownerName', 'rating', 'reviewCount', 'createdAt', 'updatedAt',
+          'variety', 'cropType', 'price', 'quantity',
+          'lastOrderId', 'lastReviewId'
+        ])
+        && data.variety is string && data.variety.size() <= 100
+        && data.cropType is string && data.cropType.size() <= 100
+        && data.price is number && data.price >= 0
+        && data.quantity is number && data.quantity >= 0;
+    }
+
+    function isValidToolProduct(data) {
+      return data.keys().hasAll([
+          'category', 'title', 'description', 'location', 'images', 'status',
+          'ownerId', 'ownerName', 'rating', 'reviewCount', 'createdAt', 'updatedAt',
+          'equipmentType', 'condition', 'pricePerHour', 'pricePerDay', 'availability'
+        ])
+        && data.keys().hasOnly([
+          'category', 'title', 'description', 'location', 'images', 'status',
+          'ownerId', 'ownerName', 'rating', 'reviewCount', 'createdAt', 'updatedAt',
+          'equipmentType', 'condition', 'pricePerHour', 'pricePerDay', 'availability',
+          'lastOrderId', 'lastReviewId'
+        ])
+        && data.equipmentType is string && data.equipmentType.size() <= 100
+        && data.condition is string && data.condition.size() <= 50
+        && data.pricePerHour is number && data.pricePerHour >= 0
+        && data.pricePerDay is number && data.pricePerDay >= 0
+        && data.availability is string && data.availability.size() <= 50;
+    }
+
+    function isValidCropProduct(data) {
+      return data.keys().hasAll([
+          'category', 'title', 'description', 'location', 'images', 'status',
+          'ownerId', 'ownerName', 'rating', 'reviewCount', 'createdAt', 'updatedAt',
+          'quantity', 'quality', 'price', 'harvestDate'
+        ])
+        && data.keys().hasOnly([
+          'category', 'title', 'description', 'location', 'images', 'status',
+          'ownerId', 'ownerName', 'rating', 'reviewCount', 'createdAt', 'updatedAt',
+          'quantity', 'quality', 'price', 'harvestDate',
+          'lastOrderId', 'lastReviewId'
+        ])
+        && data.quantity is number && data.quantity >= 0
+        && data.quality is string && data.quality.size() <= 50
+        && data.price is number && data.price >= 0
+        && data.harvestDate is string && data.harvestDate.size() <= 50;
+    }
+
+    function isValidProduct(data) {
+      return isValidProductBase(data)
+        && (
+          (data.category == 'seed' && isValidSeedProduct(data)) ||
+          (data.category == 'tool' && isValidToolProduct(data)) ||
+          (data.category == 'crop' && isValidCropProduct(data))
+        );
+    }
+
+    // --- Orders Validator ---
+    function isValidOrder(data) {
+      return data.keys().hasAll([
+          'orderId', 'buyerId', 'buyerName', 'sellerId', 'sellerName',
+          'productId', 'productTitle', 'category', 'quantity', 'unitPrice',
+          'totalPrice', 'productImage', 'location', 'status', 'paymentStatus',
+          'paymentMethod', 'stockDeducted', 'stockRestored', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'orderId', 'buyerId', 'buyerName', 'sellerId', 'sellerName',
+          'productId', 'productTitle', 'category', 'quantity', 'unitPrice',
+          'totalPrice', 'productImage', 'location', 'status', 'paymentStatus',
+          'paymentMethod', 'stockDeducted', 'stockRestored', 'createdAt', 'updatedAt',
+          'cancelledAt'
+        ])
+        && isValidString(data.orderId, 1, 100)
+        && isValidString(data.buyerId, 1, 128)
+        && isValidString(data.buyerName, 1, 100)
+        && isValidString(data.sellerId, 1, 128)
+        && isValidString(data.sellerName, 1, 100)
+        && isValidString(data.productId, 1, 100)
+        && isValidString(data.productTitle, 1, 150)
+        && data.category in ['seed', 'crop']
+        && data.quantity is number && data.quantity > 0
+        && data.unitPrice is number && data.unitPrice >= 0
+        && data.totalPrice is number && data.totalPrice >= 0
+        && data.productImage is string && data.productImage.size() <= 1000
+        && data.location is string && data.location.size() <= 150
+        && data.status in ['pending', 'confirmed', 'completed', 'cancelled']
+        && data.paymentStatus is string && data.paymentStatus.size() <= 50
+        && data.paymentMethod is string && data.paymentMethod.size() <= 50
+        && data.stockDeducted is bool
+        && data.stockRestored is bool
+        && isValidTimestamp(data.createdAt)
+        && isValidTimestamp(data.updatedAt)
+        && (!('cancelledAt' in data) || isValidTimestamp(data.cancelledAt));
+    }
+
+    // --- Bookings Validator ---
+    function isValidBooking(data) {
+      return data.keys().hasAll([
+          'bookingId', 'renterId', 'renterName', 'ownerId', 'ownerName',
+          'productId', 'productTitle', 'equipmentType', 'productImage',
+          'location', 'startDate', 'endDate', 'rentalDays', 'pricePerDay',
+          'totalPrice', 'status', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'bookingId', 'renterId', 'renterName', 'ownerId', 'ownerName',
+          'productId', 'productTitle', 'equipmentType', 'productImage',
+          'location', 'startDate', 'endDate', 'rentalDays', 'pricePerDay',
+          'totalPrice', 'status', 'createdAt', 'updatedAt'
+        ])
+        && isValidString(data.bookingId, 1, 100)
+        && isValidString(data.renterId, 1, 128)
+        && isValidString(data.renterName, 1, 100)
+        && isValidString(data.ownerId, 1, 128)
+        && isValidString(data.ownerName, 1, 100)
+        && isValidString(data.productId, 1, 100)
+        && isValidString(data.productTitle, 1, 150)
+        && isValidString(data.equipmentType, 1, 100)
+        && data.productImage is string && data.productImage.size() <= 1000
+        && data.location is string && data.location.size() <= 150
+        && data.startDate is string && data.startDate.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$')
+        && data.endDate is string && data.endDate.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$')
+        && data.rentalDays is int && data.rentalDays >= 1
+        && data.pricePerDay is number && data.pricePerDay >= 0
+        && data.totalPrice is number && data.totalPrice >= 0
+        && data.status in ['pending', 'confirmed', 'completed', 'cancelled']
+        && isValidTimestamp(data.createdAt)
+        && isValidTimestamp(data.updatedAt);
+    }
+
+    // --- Reviews Validator ---
+    function isValidReview(data) {
+      return data.keys().hasAll([
+          'productId', 'reviewerId', 'reviewerName', 'transactionType',
+          'transactionId', 'rating', 'comment', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'productId', 'reviewerId', 'reviewerName', 'transactionType',
+          'transactionId', 'rating', 'comment', 'createdAt', 'updatedAt'
+        ])
+        && isValidString(data.productId, 1, 100)
+        && isValidString(data.reviewerId, 1, 128)
+        && isValidString(data.reviewerName, 1, 100)
+        && data.transactionType in ['order', 'booking']
+        && isValidString(data.transactionId, 1, 100)
+        && data.rating is int && data.rating >= 1 && data.rating <= 5
+        && data.comment is string && data.comment.size() <= 1000
+        && isValidTimestamp(data.createdAt)
+        && isValidTimestamp(data.updatedAt);
+    }
+
+    // --- Community Posts & Comments Validators ---
+    function isValidPost(data) {
+      return data.keys().hasAll([
+          'postId', 'title', 'content', 'category', 'authorId',
+          'authorName', 'authorLocation', 'likesCount', 'commentsCount',
+          'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'postId', 'title', 'content', 'category', 'authorId',
+          'authorName', 'authorLocation', 'likesCount', 'commentsCount',
+          'createdAt', 'updatedAt',
+          'lastCommentId'
+        ])
+        && isValidString(data.postId, 1, 100)
+        && isValidString(data.title, 1, 200)
+        && isValidString(data.content, 1, 5000)
+        && data.category in [
+          'General Farming', 'Crops', 'Seeds', 'Tools & Equipment',
+          'Pest & Disease', 'Irrigation', 'Government Schemes',
+          'Market & Prices', 'Farming Advice'
+        ]
+        && isValidString(data.authorId, 1, 128)
+        && isValidString(data.authorName, 1, 100)
+        && data.authorLocation is string && data.authorLocation.size() <= 150
+        && data.likesCount is int && data.likesCount >= 0
+        && data.commentsCount is int && data.commentsCount >= 0
+        && isValidTimestamp(data.createdAt)
+        && isValidTimestamp(data.updatedAt)
+        && (!('lastCommentId' in data) || (data.lastCommentId is string && data.lastCommentId.size() <= 100));
+    }
+
+    function isValidComment(data, parentPostId) {
+      return data.keys().hasAll([
+          'commentId', 'postId', 'content', 'authorId',
+          'authorName', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'commentId', 'postId', 'content', 'authorId',
+          'authorName', 'createdAt', 'updatedAt'
+        ])
+        && isValidString(data.commentId, 1, 100)
+        && data.postId == parentPostId
+        && isValidString(data.content, 1, 1000)
+        && isValidString(data.authorId, 1, 128)
+        && isValidString(data.authorName, 1, 100)
+        && isValidTimestamp(data.createdAt)
+        && isValidTimestamp(data.updatedAt);
+    }
+
+    // --- Cross-Document Validation Helpers ---
+    function canBuyerDeductStock(productId) {
+      let orderAfter = getAfter(/databases/$(database)/documents/orders/$(request.resource.data.lastOrderId));
+      return orderAfter != null
+        && orderAfter.data.buyerId == request.auth.uid
+        && orderAfter.data.productId == productId
+        && orderAfter.data.status == 'pending'
+        && orderAfter.data.stockDeducted == true
+        && orderAfter.data.stockRestored == false
+        && orderAfter.data.quantity == resource.data.quantity - request.resource.data.quantity;
+    }
+
+    function canBuyerRestoreStock(productId) {
+      let orderBefore = get(/databases/$(database)/documents/orders/$(request.resource.data.lastOrderId));
+      let orderAfter = getAfter(/databases/$(database)/documents/orders/$(request.resource.data.lastOrderId));
+      return orderBefore != null
+        && orderBefore.data.buyerId == request.auth.uid
+        && orderBefore.data.productId == productId
+        && orderBefore.data.status == 'pending'
+        && orderBefore.data.stockRestored == false
+        && orderAfter != null
+        && orderAfter.data.status == 'cancelled'
+        && orderAfter.data.stockRestored == true
+        && orderAfter.data.quantity == request.resource.data.quantity - resource.data.quantity;
+    }
+
+    function isValidAtomicOrderCreation(orderId) {
+      let productBefore = get(/databases/$(database)/documents/products/$(request.resource.data.productId));
+      let productAfter = getAfter(/databases/$(database)/documents/products/$(request.resource.data.productId));
+      return productBefore != null
+        && productBefore.data.status == 'active'
+        && productBefore.data.category in ['seed', 'crop']
+        && request.resource.data.category == productBefore.data.category
+        && request.resource.data.sellerId == productBefore.data.ownerId
+        && request.resource.data.sellerId != request.auth.uid
+        && request.resource.data.unitPrice == productBefore.data.price
+        && request.resource.data.quantity is number && request.resource.data.quantity > 0
+        && request.resource.data.quantity <= productBefore.data.quantity
+        && request.resource.data.totalPrice == request.resource.data.unitPrice * request.resource.data.quantity
+        && request.resource.data.status == 'pending'
+        && request.resource.data.paymentStatus == 'pending'
+        && request.resource.data.stockDeducted == true
+        && request.resource.data.stockRestored == false
+        && productAfter != null
+        && productAfter.data.quantity == productBefore.data.quantity - request.resource.data.quantity
+        && productAfter.data.lastOrderId == orderId;
+    }
+
+    function isValidAtomicOrderCancellation(orderId) {
+      let productBefore = get(/databases/$(database)/documents/products/$(resource.data.productId));
+      let productAfter = getAfter(/databases/$(database)/documents/products/$(resource.data.productId));
+      return productAfter != null
+        && productAfter.data.quantity == productBefore.data.quantity + resource.data.quantity
+        && productAfter.data.lastOrderId == orderId;
+    }
+
+    function isVerifiedOrderReview(transactionId, productId) {
+      let order = get(/databases/$(database)/documents/orders/$(transactionId));
+      return order != null
+        && order.data.buyerId == request.auth.uid
+        && order.data.productId == productId
+        && order.data.status == 'completed';
+    }
+
+    function isVerifiedBookingReview(transactionId, productId) {
+      let booking = get(/databases/$(database)/documents/bookings/$(transactionId));
+      return booking != null
+        && booking.data.renterId == request.auth.uid
+        && booking.data.productId == productId
+        && booking.data.status == 'completed';
+    }
+
+    function isVerifiedReviewTransaction() {
+      return (request.resource.data.transactionType == 'order'
+              && isVerifiedOrderReview(request.resource.data.transactionId, request.resource.data.productId))
+          || (request.resource.data.transactionType == 'booking'
+              && isVerifiedBookingReview(request.resource.data.transactionId, request.resource.data.productId));
+    }
+
+    function isValidAtomicRatingUpdate(productId) {
+      let reviewRef = /databases/$(database)/documents/reviews/$(request.resource.data.lastReviewId);
+      let reviewAfter = getAfter(reviewRef);
+      let currentCount = resource.data.reviewCount;
+      let newCount = request.resource.data.reviewCount;
+      let currentRating = resource.data.rating;
+      let newRating = request.resource.data.rating;
+      let expectedAvg = (currentRating * currentCount + reviewAfter.data.rating) / newCount;
+
+      return !exists(reviewRef)
+        && existsAfter(reviewRef)
+        && reviewAfter != null
+        && reviewAfter.data.reviewerId == request.auth.uid
+        && reviewAfter.data.productId == productId
+        && newCount == currentCount + 1
+        && (
+          (currentCount == 0 && newRating == reviewAfter.data.rating)
+          || (currentCount > 0
+              && newRating >= 0 && newRating <= 5
+              && (newRating - expectedAvg) >= -0.06
+              && (newRating - expectedAvg) <= 0.06)
+        );
+    }
+
+    function isValidAtomicBookingCreation(bookingId) {
+      let product = get(/databases/$(database)/documents/products/$(request.resource.data.productId));
+      return product != null
+        && product.data.status == 'active'
+        && product.data.category == 'tool'
+        && request.resource.data.bookingId == bookingId
+        && request.resource.data.ownerId == product.data.ownerId
+        && request.resource.data.ownerId != request.auth.uid
+        && request.resource.data.pricePerDay == product.data.pricePerDay
+        && request.resource.data.rentalDays is int && request.resource.data.rentalDays >= 1
+        && request.resource.data.totalPrice == request.resource.data.pricePerDay * request.resource.data.rentalDays
+        && request.resource.data.startDate is string && request.resource.data.endDate is string
+        && request.resource.data.startDate <= request.resource.data.endDate
+        && request.resource.data.status == 'pending';
+    }
+
+    function hasImmutableOrderFields() {
+      return request.resource.data.buyerId == resource.data.buyerId
+        && request.resource.data.sellerId == resource.data.sellerId
+        && request.resource.data.productId == resource.data.productId
+        && request.resource.data.quantity == resource.data.quantity
+        && request.resource.data.unitPrice == resource.data.unitPrice
+        && request.resource.data.totalPrice == resource.data.totalPrice
+        && request.resource.data.createdAt == resource.data.createdAt
+        && request.resource.data.stockDeducted == resource.data.stockDeducted;
+    }
+
+    function hasImmutableBookingFields() {
+      return request.resource.data.renterId == resource.data.renterId
+        && request.resource.data.ownerId == resource.data.ownerId
+        && request.resource.data.productId == resource.data.productId
+        && request.resource.data.startDate == resource.data.startDate
+        && request.resource.data.endDate == resource.data.endDate
+        && request.resource.data.rentalDays == resource.data.rentalDays
+        && request.resource.data.pricePerDay == resource.data.pricePerDay
+        && request.resource.data.totalPrice == resource.data.totalPrice
+        && request.resource.data.createdAt == resource.data.createdAt;
+    }
+
+    // ===============================================================
+    // Collection Rules
+    // ===============================================================
+
+    // --- 1. Users Collection ---
+    // User profile documents store PII (email, phone, location).
+    // Read and write access is strictly limited to the authenticated account owner.
+    match /users/{userId} {
+      allow read: if isOwner(userId);
+
+      allow create: if isOwner(userId)
+        && isValidUser(request.resource.data);
+
+      allow update: if isOwner(userId)
+        && request.resource.data.uid == resource.data.uid
+        && request.resource.data.email == resource.data.email
+        && request.resource.data.createdAt == resource.data.createdAt
+        && isValidUser(request.resource.data);
+
+      allow delete: if false;
+    }
+
+    // --- 2. Products Collection ---
+    // Marketplace products for Seeds, Tools, and Crops.
+    // Active products are publicly readable. Inactive products are visible only to the owner.
+    match /products/{productId} {
+      allow read: if resource.data.status == 'active'
+        || (isAuthenticated() && resource.data.ownerId == request.auth.uid);
+
+      allow create: if isAuthenticated()
+        && request.resource.data.ownerId == request.auth.uid
+        && request.resource.data.ownerId != 'demo-owner-001'
+        && isValidProduct(request.resource.data);
+
+      allow update: if
+        // A. Owner edit
+        (resource.data.ownerId == request.auth.uid
+          && resource.data.ownerId != 'demo-owner-001'
+          && request.resource.data.ownerId == resource.data.ownerId
+          && request.resource.data.createdAt == resource.data.createdAt
+          && isValidProduct(request.resource.data))
+        ||
+        // B. Non-owner buyer decrementing stock during purchase
+        (isAuthenticated()
+          && resource.data.ownerId != request.auth.uid
+          && resource.data.status == 'active'
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['quantity', 'lastOrderId', 'updatedAt'])
+          && request.resource.data.quantity is number
+          && request.resource.data.quantity >= 0
+          && request.resource.data.quantity < resource.data.quantity
+          && request.resource.data.lastOrderId is string
+          && canBuyerDeductStock(productId))
+        ||
+        // C. Non-owner buyer restoring stock during order cancellation
+        (isAuthenticated()
+          && resource.data.ownerId != request.auth.uid
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['quantity', 'lastOrderId', 'updatedAt'])
+          && request.resource.data.quantity is number
+          && request.resource.data.quantity > resource.data.quantity
+          && request.resource.data.lastOrderId is string
+          && canBuyerRestoreStock(productId))
+        ||
+        // D. Non-owner reviewer updating rating aggregates (atomic review creation only)
+        (isAuthenticated()
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['rating', 'reviewCount', 'lastReviewId', 'updatedAt'])
+          && request.resource.data.rating is number
+          && request.resource.data.rating >= 0 && request.resource.data.rating <= 5
+          && request.resource.data.reviewCount is int && request.resource.data.reviewCount >= 0
+          && request.resource.data.lastReviewId is string
+          && isValidAtomicRatingUpdate(productId));
+
+      // Only owner can delete products.
+      // Demo products and demo owner 'demo-owner-001' are protected against deletion.
+      allow delete: if isAuthenticated()
+        && resource.data.ownerId == request.auth.uid
+        && resource.data.ownerId != 'demo-owner-001'
+        && !productId.matches('^demo-.*');
+    }
+
+    // --- 3. Orders Collection ---
+    // --- 3. Orders Collection ---
+    // Direct purchase orders for Seeds and Crops.
+    // Confidential between buyer and seller.
+    match /orders/{orderId} {
+      allow read: if resource.data.buyerId == request.auth.uid
+        || resource.data.sellerId == request.auth.uid;
+
+      allow create: if isAuthenticated()
+        && request.resource.data.buyerId == request.auth.uid
+        && request.resource.data.orderId == orderId
+        && isValidOrder(request.resource.data)
+        && isValidAtomicOrderCreation(orderId);
+
+      allow update: if isAuthenticated()
+        && hasImmutableOrderFields()
+        && (
+          // A. Buyer cancellation (strictly from pending status, with atomic stock restoration)
+          (resource.data.buyerId == request.auth.uid
+            && resource.data.status == 'pending'
+            && resource.data.stockRestored == false
+            && request.resource.data.status == 'cancelled'
+            && request.resource.data.stockRestored == true
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'stockRestored', 'cancelledAt', 'updatedAt'])
+            && isValidAtomicOrderCancellation(orderId))
+          ||
+          // B. Seller cancellation (from pending or confirmed status, with atomic stock restoration)
+          (resource.data.sellerId == request.auth.uid
+            && resource.data.status in ['pending', 'confirmed']
+            && resource.data.stockRestored == false
+            && request.resource.data.status == 'cancelled'
+            && request.resource.data.stockRestored == true
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'stockRestored', 'cancelledAt', 'updatedAt'])
+            && isValidAtomicOrderCancellation(orderId))
+          ||
+          // C. Seller confirmation (strictly pending -> confirmed)
+          (resource.data.sellerId == request.auth.uid
+            && resource.data.status == 'pending'
+            && request.resource.data.status == 'confirmed'
+            && request.resource.data.stockRestored == resource.data.stockRestored
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'updatedAt'])
+            && isValidOrder(request.resource.data))
+          ||
+          // D. Seller completion (strictly confirmed -> completed)
+          (resource.data.sellerId == request.auth.uid
+            && resource.data.status == 'confirmed'
+            && request.resource.data.status == 'completed'
+            && request.resource.data.stockRestored == resource.data.stockRestored
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'updatedAt'])
+            && isValidOrder(request.resource.data))
+        );
+
+      allow delete: if false;
+    }
+
+    // --- 4. Bookings Collection ---
+    // Equipment and machinery rental bookings.
+    // Read access is available to authenticated users to verify equipment availability and overlaps.
+    match /bookings/{bookingId} {
+      allow read: if isAuthenticated();
+
+      allow create: if isAuthenticated()
+        && request.resource.data.renterId == request.auth.uid
+        && isValidBooking(request.resource.data)
+        && isValidAtomicBookingCreation(bookingId);
+
+      allow update: if isAuthenticated()
+        && hasImmutableBookingFields()
+        && (
+          // A. Renter cancellation (strictly pending -> cancelled)
+          (resource.data.renterId == request.auth.uid
+            && resource.data.status == 'pending'
+            && request.resource.data.status == 'cancelled'
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'updatedAt'])
+            && isValidBooking(request.resource.data))
+          ||
+          // B. Owner confirmation (strictly pending -> confirmed)
+          (resource.data.ownerId == request.auth.uid
+            && resource.data.status == 'pending'
+            && request.resource.data.status == 'confirmed'
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'updatedAt'])
+            && isValidBooking(request.resource.data))
+          ||
+          // C. Owner completion (strictly confirmed -> completed)
+          (resource.data.ownerId == request.auth.uid
+            && resource.data.status == 'confirmed'
+            && request.resource.data.status == 'completed'
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'updatedAt'])
+            && isValidBooking(request.resource.data))
+          ||
+          // D. Owner cancellation (pending or confirmed -> cancelled)
+          (resource.data.ownerId == request.auth.uid
+            && resource.data.status in ['pending', 'confirmed']
+            && request.resource.data.status == 'cancelled'
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'updatedAt'])
+            && isValidBooking(request.resource.data))
+        );
+
+      allow delete: if false;
+    }
+
+    // --- 5. Reviews Collection ---
+    // Public reviews and 1-5 star ratings for products.
+    // Deterministic document ID ({transactionId}) guarantees 1 review per transaction.
+    // Ratings are immutable once submitted to preserve mathematical integrity of aggregates.
+    match /reviews/{reviewId} {
+      allow read: if true;
+
+      allow create: if isAuthenticated()
+        && request.resource.data.reviewerId == request.auth.uid
+        && request.resource.data.transactionId == reviewId
+        && isValidReview(request.resource.data)
+        && isVerifiedReviewTransaction();
+
+      allow update: if isAuthenticated()
+        && resource.data.reviewerId == request.auth.uid
+        && request.resource.data.reviewerId == resource.data.reviewerId
+        && request.resource.data.productId == resource.data.productId
+        && request.resource.data.transactionType == resource.data.transactionType
+        && request.resource.data.transactionId == resource.data.transactionId
+        && request.resource.data.rating == resource.data.rating
+        && request.resource.data.createdAt == resource.data.createdAt
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['comment', 'updatedAt'])
+        && isValidReview(request.resource.data);
+
+      allow delete: if false;
+    }
+
+    // --- 6. Community Posts & Subcollections ---
+    // Farmer forum discussions with likes and comments.
+    match /communityPosts/{postId} {
+      allow read: if isAuthenticated();
+
+      allow create: if isAuthenticated()
+        && request.resource.data.authorId == request.auth.uid
+        && request.resource.data.likesCount == 0
+        && request.resource.data.commentsCount == 0
+        && isValidPost(request.resource.data);
+
+      allow update: if
+        // A. Author editing post
+        (resource.data.authorId == request.auth.uid
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['title', 'content', 'category', 'updatedAt'])
+          && request.resource.data.authorId == resource.data.authorId
+          && request.resource.data.createdAt == resource.data.createdAt
+          && isValidPost(request.resource.data))
+        ||
+        // B. Likes counter toggle
+        (request.resource.data.diff(resource.data).affectedKeys().hasOnly(['likesCount'])
+          && (
+            (request.resource.data.likesCount == resource.data.likesCount + 1
+             && existsAfter(/databases/$(database)/documents/communityPosts/$(postId)/likes/$(request.auth.uid))
+             && !exists(/databases/$(database)/documents/communityPosts/$(postId)/likes/$(request.auth.uid)))
+            ||
+            (request.resource.data.likesCount == resource.data.likesCount - 1
+             && request.resource.data.likesCount >= 0
+             && !existsAfter(/databases/$(database)/documents/communityPosts/$(postId)/likes/$(request.auth.uid))
+             && exists(/databases/$(database)/documents/communityPosts/$(postId)/likes/$(request.auth.uid)))
+          ))
+        ||
+        // C. Comments counter toggle
+        (request.resource.data.diff(resource.data).affectedKeys().hasOnly(['commentsCount', 'lastCommentId'])
+          && request.resource.data.lastCommentId is string
+          && (
+            (request.resource.data.commentsCount == resource.data.commentsCount + 1
+             && existsAfter(/databases/$(database)/documents/communityPosts/$(postId)/comments/$(request.resource.data.lastCommentId))
+             && !exists(/databases/$(database)/documents/communityPosts/$(postId)/comments/$(request.resource.data.lastCommentId))
+             && getAfter(/databases/$(database)/documents/communityPosts/$(postId)/comments/$(request.resource.data.lastCommentId)).data.authorId == request.auth.uid)
+            ||
+            (request.resource.data.commentsCount == resource.data.commentsCount - 1
+             && request.resource.data.commentsCount >= 0
+             && !existsAfter(/databases/$(database)/documents/communityPosts/$(postId)/comments/$(request.resource.data.lastCommentId))
+             && exists(/databases/$(database)/documents/communityPosts/$(postId)/comments/$(request.resource.data.lastCommentId))
+             && get(/databases/$(database)/documents/communityPosts/$(postId)/comments/$(request.resource.data.lastCommentId)).data.authorId == request.auth.uid)
+          ));
+
+      allow delete: if isAuthenticated()
+        && resource.data.authorId == request.auth.uid;
+
+      // Likes subcollection: communityPosts/{postId}/likes/{likeUserId}
+      match /likes/{likeUserId} {
+        allow read: if isAuthenticated();
+
+        allow create: if isAuthenticated()
+          && request.auth.uid == likeUserId
+          && request.resource.data.userId == request.auth.uid
+          && exists(/databases/$(database)/documents/communityPosts/$(postId))
+          && getAfter(/databases/$(database)/documents/communityPosts/$(postId)).data.likesCount == get(/databases/$(database)/documents/communityPosts/$(postId)).data.likesCount + 1;
+
+        allow update: if false;
+
+        allow delete: if isAuthenticated()
+          && request.auth.uid == likeUserId
+          && exists(/databases/$(database)/documents/communityPosts/$(postId))
+          && getAfter(/databases/$(database)/documents/communityPosts/$(postId)).data.likesCount == get(/databases/$(database)/documents/communityPosts/$(postId)).data.likesCount - 1;
+      }
+
+      // Comments subcollection: communityPosts/{postId}/comments/{commentId}
+      match /comments/{commentId} {
+        allow read: if isAuthenticated();
+
+        allow create: if isAuthenticated()
+          && request.resource.data.authorId == request.auth.uid
+          && isValidComment(request.resource.data, postId)
+          && exists(/databases/$(database)/documents/communityPosts/$(postId))
+          && getAfter(/databases/$(database)/documents/communityPosts/$(postId)).data.commentsCount == get(/databases/$(database)/documents/communityPosts/$(postId)).data.commentsCount + 1
+          && getAfter(/databases/$(database)/documents/communityPosts/$(postId)).data.lastCommentId == commentId;
+
+        allow update: if isAuthenticated()
+          && resource.data.authorId == request.auth.uid
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['content', 'updatedAt'])
+          && request.resource.data.authorId == resource.data.authorId
+          && request.resource.data.postId == resource.data.postId
+          && request.resource.data.createdAt == resource.data.createdAt
+          && isValidComment(request.resource.data, postId);
+
+        allow delete: if isAuthenticated()
+          && resource.data.authorId == request.auth.uid
+          && exists(/databases/$(database)/documents/communityPosts/$(postId))
+          && getAfter(/databases/$(database)/documents/communityPosts/$(postId)).data.commentsCount == get(/databases/$(database)/documents/communityPosts/$(postId)).data.commentsCount - 1
+          && getAfter(/databases/$(database)/documents/communityPosts/$(postId)).data.lastCommentId == commentId;
+      }
+    }
+
+    // ===============================================================
+    // Default Deny Rule
+    // ===============================================================
+    // Deny read and write access to all undefined collections and documents.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

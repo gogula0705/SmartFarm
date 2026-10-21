@@ -409,6 +409,7 @@ export async function createComment({ postId, content, authorId, authorName }) {
     transaction.set(newCommentDoc, commentData);
     transaction.update(postRef, {
       commentsCount: currentComments + 1,
+      lastCommentId: newCommentDoc.id,
     });
 
     return {
@@ -517,6 +518,7 @@ export async function deleteComment(postId, commentId, currentUserId) {
       const currentComments = postDoc.data().commentsCount || 0;
       transaction.update(postRef, {
         commentsCount: Math.max(0, currentComments - 1),
+        lastCommentId: commentId,
       });
     }
 

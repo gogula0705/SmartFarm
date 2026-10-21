@@ -2,7 +2,7 @@ import { useState, useMemo, useEffect } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
 import { useLanguage } from '../context/useLanguage';
 import { sampleProducts } from '../data/sampleProducts';
-import { getMarketplaceProducts } from '../services/productService';
+import { subscribeMarketplaceProducts } from '../services/productService';
 import ProductCard from '../components/ProductCard';
 
 function Marketplace() {
@@ -26,37 +26,34 @@ function Marketplace() {
   const [minRating, setMinRating] = useState('');
   const [sortBy, setSortBy] = useState('newest');
 
-  // Load active products from Cloud Firestore (fallback to sampleProducts if empty or error)
+  // Subscribe to active products from Cloud Firestore in real time
   useEffect(() => {
     let isMounted = true;
 
-    async function loadProducts() {
-      try {
-        setLoading(true);
-        setErrorNotice(null);
-        const liveProducts = await getMarketplaceProducts();
-        if (isMounted) {
-          if (liveProducts && liveProducts.length > 0) {
-            setProducts(liveProducts);
-          } else {
-            setProducts(sampleProducts);
-          }
-          setLoading(false);
-        }
-      } catch (err) {
-        console.error('Error fetching marketplace products:', err);
-        if (isMounted) {
+    const unsubscribe = subscribeMarketplaceProducts(
+      (liveProducts) => {
+        if (!isMounted) return;
+        if (liveProducts && liveProducts.length > 0) {
+          setProducts(liveProducts);
+        } else {
           setProducts(sampleProducts);
-          setErrorNotice(t('marketplace.offlineNotice'));
-          setLoading(false);
         }
+        setLoading(false);
+      },
+      (err) => {
+        if (!isMounted) return;
+        console.warn('Real-time marketplace notice:', err.message);
+        setProducts(sampleProducts);
+        setErrorNotice(t('marketplace.offlineNotice'));
+        setLoading(false);
       }
-    }
-
-    loadProducts();
+    );
 
     return () => {
       isMounted = false;
+      if (typeof unsubscribe === 'function') {
+        unsubscribe();
+      }
     };
   }, [t]);
 
